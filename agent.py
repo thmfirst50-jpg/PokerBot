@@ -39,72 +39,132 @@ from game import Action, AgentConfig, HandResult, Observation, Street
 warmup()
 
 # rename as your team/bot's name
-PARTICIPANT = "TotallyAwesomeDatathonParticipant"
-AGENT_NAME = "JustAsAwesomeAgent"
+PARTICIPANT = "BANG"
+AGENT_NAME = "LarpGentV1"
 
 
 # ===== YOUR CODE HERE =====
 
-def new_half(config: AgentConfig, memory: dict) -> None:
-    """Called at the start of each half-match (1000 hands).
+import time
+from preflop_eval import compute_preflop_percentile
+from opponent_model import (
+    init_opponent_memory,
+    update_live_action_stats,
+    update_on_hand_end,
+    get_opponent_profile,
+)
+from postflop_engine import choose_postflop_action
 
-    `memory` is a fresh, empty dict every half. Store anything you want to
-    remember between hands in it, e.g. memory["opp_raises"] = 0.
-    `config` holds the match settings (starting_stack, big_blind, ...).
 
-    In the tournament, each half runs in a brand-new copy of your server,
-    so nothing you learn in one half carries over to the other half.
-    """
-    memory["hands_played"] = 0
+def _safe_fallback(obs: Observation) -> Action:
+    if Action.CHECK_CALL in obs.legal_actions and obs.to_call == 0:
+        return Action.CHECK_CALL
+    if Action.FOLD in obs.legal_actions and obs.to_call > obs.big_blind * 2:
+        return Action.FOLD
+    return obs.legal_actions[0]
+
+
+def _choose_preflop_action(obs: Observation, prof: dict) -> Action:
+    strength = compute_preflop_percentile(obs.hole_cards)
+
+    # Positional adjustment: button acts last postflop
+    if obs.is_button:
+        strength += 0.035
+
+    # Adjust for opponent preflop tendencies
+    if prof["is_maniac"]:
+        strength += 0.040
+    elif prof["is_nit"] and obs.raises_this_street >= 1:
+        strength -= 0.040
+
+    # Unopened pot or limped pot (to_call <= 2)
+    if obs.to_call <= obs.big_blind:
+        if strength >= 0.58 and Action.RAISE_POT in obs.legal_actions:
+            return Action.RAISE_POT
+        if strength >= 0.49 and Action.RAISE_HALF in obs.legal_actions:
+            return Action.RAISE_HALF
+        if obs.to_call == 0:
+            return Action.CHECK_CALL
+        # Button completes small blind (1 chip into 3 chip pot = 25% pot odds) with wide playable range
+        if obs.to_call == 1 and strength >= 0.36:
+            return Action.CHECK_CALL
+        if Action.FOLD in obs.legal_actions:
+            return Action.FOLD
+        return Action.CHECK_CALL
+
+    # Facing a preflop raise (to_call > 2)
+    pot_odds = obs.to_call / float(obs.pot + obs.to_call)
+
+    # 3-bet / 4-bet with premium double-suited / high-wrap hands
+    if strength >= 0.64 and obs.raises_this_street <= 2:
+        if Action.RAISE_POT in obs.legal_actions and strength >= 0.68:
+            return Action.RAISE_POT
+        if Action.RAISE_HALF in obs.legal_actions:
+            return Action.RAISE_HALF
+
+    # Call preflop raise if hand strength justifies pot odds and playability
+    required_strength = max(0.44, pot_odds + 0.12 - (0.03 if obs.is_button else 0.0))
+    if obs.raises_this_street >= 2:
+        required_strength += 0.05  # Respect 3-bets/4-bets unless opponent is a maniac
+
+    if strength >= required_strength:
+        return Action.CHECK_CALL
+
+    if Action.FOLD in obs.legal_actions:
+        return Action.FOLD
+    return Action.CHECK_CALL
+
+
+def new_half(config, memory: dict) -> None:
+    try:
+        init_opponent_memory(memory)
+    except Exception:
+        pass
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:
-    """Called every time it is your turn. Return one of obs.legal_actions.
+    t0 = time.perf_counter()
+    try:
+        if "time_spent" not in memory:
+            init_opponent_memory(memory)
 
-    What you can see in obs:
-        hand_index          which hand of the half this is (0, 1, 2, ...)
-        street              Street.PREFLOP, Street.FLOP, Street.TURN or Street.RIVER
-        hole_cards          your 5 cards as ints, sorted ascending (0-35)
-        board               board (community) cards seen so far (0, 3, 4 or 5 ints)
-        pot                 total chips both players put in this hand
-        to_call             chips you must add to match the opponent
-        my_bet, opp_bet     chips you,opponent put in on THIS street
-        my_stack, opp_stack chips each player still has behind
-        is_button           True if you are the button (small blind)
-        legal_actions       the Actions you may return right now
-        raise_to            {RAISE_HALF: total, RAISE_POT: total} for legal raises
-        min_raise_to        smallest normal raise total (all-ins may be lower)
-        raises_this_street  raises so far this street (max 4)
-        action_history      this hand's actions so far; each has
-                            street, is_me, action, amount, street_total
-        big_blind           size of the big blind in chips
+        update_live_action_stats(obs, memory)
+        prof = get_opponent_profile(memory)
 
-    Actions: Action.FOLD, Action.CHECK_CALL, Action.RAISE_HALF, Action.RAISE_POT
-    Cards are ints: card_rank(c) is 0 (six) .. 8 (ace), card_suit(c) is 0..3,
-    and cards_to_str(obs.hole_cards) prints them like "6h 7c 9s Kd Ah".
-    Once all 5 board cards are out, omaha_score(obs.hole_cards, obs.board)
-    scores your hand (higher is better).
-    """
+        if obs.street == Street.PREFLOP:
+            action = _choose_preflop_action(obs, prof)
+        else:
+            # Dynamic Time-Bank Allocation (8.0s limit per 1,000 hands; keep under 4.5s target)
+            spent = memory.get("time_spent", 0.0)
+            if spent > 3.6:
+                samples = 15  # Emergency low-latency mode
+            elif spent > 2.6:
+                samples = 28
+            else:
+                # Allocate more rollouts to high-stakes pots
+                samples = 55 if obs.pot >= 16 else 32
 
-    # Simple example of a heuristic bot, which just checks when it is of no cost, otherwise folds
-    # Replace this with your strategy!
-    if obs.to_call == 0:
-        return Action.CHECK_CALL
-    return Action.FOLD
+            action = choose_postflop_action(obs, prof, samples)
+
+        if action not in obs.legal_actions:
+            action = _safe_fallback(obs)
+    except Exception:
+        action = _safe_fallback(obs)
+    finally:
+        # First 1ms of each request is free per tournament rules
+        elapsed = max(0.0, (time.perf_counter() - t0) - 0.001)
+        memory["time_spent"] = memory.get("time_spent", 0.0) + elapsed
+
+    return action
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
-    """Called once for every finished hand. Optional: learn from what happened.
-
-    To save time, the judge sends finished hands along with your next
-    decision request, so this always runs BEFORE choose_action() sees the
-    next hand. (The last hands of a half arrive at the end of the half.)
-
-    result has: hand_index, my_net (chips won or lost), pot,
-    went_to_showdown, board (cards revealed), opp_hole (opponent's cards,
-    only after a showdown, else None), winner ('me', 'opp' or 'split').
-    """
-    memory["hands_played"] += 1
+    try:
+        if "time_spent" not in memory:
+            init_opponent_memory(memory)
+        update_on_hand_end(result, memory)
+    except Exception:
+        pass
 
 # ===== END OF YOUR CODE =====
 
