@@ -1,174 +1,294 @@
-import random
-from game import Action, Street, Observation
-from evaluator import omaha_score
-from preflop_eval import compute_preflop_percentile
+from itertools import combinations
+from random import Random
+import game as g
+import evaluator
 
-ALL_CARDS = list(range(36))
-
-
-def estimate_postflop_equity(obs: Observation, num_samples: int, opp_tightness: float) -> tuple[float, float]:
-    """
-    Returns (equity, nut_redraw_rate) in [0.0, 1.0].
-    Uses rejection sampling on opponent hole cards when opponent has raised heavily.
-    nut_redraw_rate measures how often our hand finishes as Flush (cat >= 6) or Full House (cat >= 5).
-    """
-    hole = list(obs.hole_cards)
-    board = list(obs.board)
-    known = set(hole) | set(board)
-    deck = [c for c in ALL_CARDS if c not in known]
-
-    cards_needed_board = 5 - len(board)
-    wins = 0.0
-    nut_finishes = 0.0
-
-    # River optimization: our score is fixed, only sample opponent 5-card hands
-    if cards_needed_board == 0:
-        my_score = omaha_score(hole, board)
-        my_cat = my_score >> 20
-        is_nut_now = 1.0 if my_cat >= 6 else (0.6 if my_cat == 5 else 0.0)
-
-        for _ in range(num_samples):
-            opp_hole = random.sample(deck, 5)
-            if opp_tightness > 0.45 and random.random() < 0.65:
-                # Bias opponent toward stronger preflop hands when they raised
-                if compute_preflop_percentile(sorted(opp_hole)) < opp_tightness:
-                    opp_hole = random.sample(deck, 5)
-            opp_score = omaha_score(opp_hole, board)
-            if my_score > opp_score:
-                wins += 1.0
-            elif my_score == opp_score:
-                wins += 0.5
-        return wins / max(1, num_samples), is_nut_now
-
-    # Flop / Turn rollout
-    sample_count = 5 + cards_needed_board
-    for _ in range(num_samples):
-        drawn = random.sample(deck, sample_count)
-        opp_hole = drawn[:5]
-        if opp_tightness > 0.45 and random.random() < 0.55:
-            if compute_preflop_percentile(sorted(opp_hole)) < opp_tightness:
-                drawn = random.sample(deck, sample_count)
-                opp_hole = drawn[:5]
-
-        full_board = board + drawn[5:]
-        my_score = omaha_score(hole, full_board)
-        opp_score = omaha_score(opp_hole, full_board)
-
-        if my_score > opp_score:
-            wins += 1.0
-        elif my_score == opp_score:
-            wins += 0.5
-
-        if (my_score >> 20) >= 6:
-            nut_finishes += 1.0
-        elif (my_score >> 20) == 5:
-            nut_finishes += 0.5
-
-    return wins / max(1, num_samples), nut_finishes / max(1, num_samples)
+TABLE = evaluator.get_table()
+BITS = tuple(1 << card for card in range(36))
+PAIRS_5 = tuple(combinations(range(5), 2))
 
 
-def compute_blocker_bonus(obs: Observation) -> float:
-    """
-    In Short Deck 5-Card PLO, a Flush requires EXACTLY 2 suited hole cards + 3 suited board cards.
-    If the board has >= 3 cards of suit S, and we hold the Ace (rank 8) or King (rank 7) of suit S,
-    we heavily block the opponent from holding the nut flush.
-    """
-    board = obs.board
-    if len(board) < 3:
-        return 0.0
-
-    board_suit_counts = [0, 0, 0, 0]
-    for c in board:
-        board_suit_counts[c & 3] += 1
-
-    bonus = 0.0
-    for s in range(4):
-        if board_suit_counts[s] >= 3:
-            my_suited_ranks = [c >> 2 for c in obs.hole_cards if (c & 3) == s]
-            # Even if we only have 1 card of suit s (no flush), holding Ace of suit s blocks nut flush!
-            if 8 in my_suited_ranks:
-                bonus += 0.08
-            elif 7 in my_suited_ranks:
-                bonus += 0.04
-    return bonus
+def _score_list(pairs, triples) -> int:
+    best = 0
+    for p in pairs:
+        for t in triples:
+            v = TABLE[p | t]
+            if v > best:
+                best = v
+    return best
 
 
-def choose_postflop_action(obs: Observation, prof: dict, num_samples: int) -> Action:
-    # Determine how tight opponent's range is based on betting so far
-    opp_tightness = 0.40
-    if obs.to_call > 0 or obs.raises_this_street > 0:
-        opp_tightness = 0.50 if not prof["is_maniac"] else 0.36
+def compute_stratified_equities(hole, board, rng: Random, count: int):
+    available = [BITS[c] for c in range(36) if c not in hole and c not in board]
+    hero_pairs = tuple(BITS[a] | BITS[b] for a, b in combinations(hole, 2))
+    shared = [BITS[c] for c in board]
+    street_len = len(board)
 
-    equity, nut_rate = estimate_postflop_equity(obs, num_samples, opp_tightness)
-    blocker_bonus = compute_blocker_bonus(obs)
+    # River
+    if street_len == 5:
+        t0, t1, t2, t3, t4, t5, t6, t7, t8, t9 = (a | b | c for a, b, c in combinations(shared, 3))
+        current_triples = (t0, t1, t2, t3, t4, t5, t6, t7, t8, t9)
+        ours = _score_list(hero_pairs, current_triples)
 
-    # Positional realization adjustment (acting last on button realizes more equity)
-    pos_adj = 0.035 if obs.is_button else -0.020
-    eff_equity = min(0.99, max(0.01, equity + pos_adj * (1.0 if obs.street != Street.RIVER else 0.0)))
+        pair_scores = {}
+        max_opp_possible = 0
+        for a, b in combinations(available, 2):
+            p = a | b
+            s = max(
+                TABLE[p | t0], TABLE[p | t1], TABLE[p | t2], TABLE[p | t3], TABLE[p | t4],
+                TABLE[p | t5], TABLE[p | t6], TABLE[p | t7], TABLE[p | t8], TABLE[p | t9],
+            )
+            pair_scores[p] = s
+            if s > max_opp_possible:
+                max_opp_possible = s
 
-    # Adjust equity based on opponent profile
-    if prof["is_maniac"] and obs.to_call > 0:
-        eff_equity = min(0.98, eff_equity + 0.065)
-    elif prof["is_nit"] and obs.to_call > obs.big_blind * 2:
-        eff_equity = max(0.01, eff_equity - 0.060)
+        samples = []
+        total_share = 0.0
+        for _ in range(count):
+            d0, d1, d2, d3, d4 = rng.sample(available, 5)
+            theirs = max(
+                pair_scores[d0 | d1], pair_scores[d0 | d2], pair_scores[d0 | d3], pair_scores[d0 | d4],
+                pair_scores[d1 | d2], pair_scores[d1 | d3], pair_scores[d1 | d4],
+                pair_scores[d2 | d3], pair_scores[d2 | d4],
+                pair_scores[d3 | d4],
+            )
+            share = 1.0 if ours > theirs else (0.5 if ours == theirs else 0.0)
+            total_share += share
+            samples.append((theirs, share))
 
-    pot = float(obs.pot)
-    to_call = float(obs.to_call)
-    eff_stack = float(min(obs.my_stack, obs.opp_stack + obs.to_call))
-    spr = eff_stack / max(1.0, pot)
+        samples.sort(key=lambda x: x[0])
+        sorted_shares = [s for _, s in samples]
+        raw_eq = total_share / count
+        nut_eq = 1.0 if ours >= max_opp_possible else (raw_eq if (ours >> 20) >= 6 else 0.0)
+        return raw_eq, nut_eq, sorted_shares
 
-    # CASE 1: We are facing a free check (to_call == 0)
-    if obs.to_call == 0:
-        # 2-PLY DEPTH-FIRST LOOKAHEAD: Should we Check-Trap or Bet Out?
-        # Against maniacs when we have a monster (eff_equity > 0.78), checking induces a bluff!
-        if prof["is_maniac"] and eff_equity > 0.78 and obs.street in (Street.FLOP, Street.TURN):
-            if not obs.is_button and Action.CHECK_CALL in obs.legal_actions:
-                # Check out-of-position to let the maniac bet into us, then raise!
-                return Action.CHECK_CALL
+    # Turn
+    if street_len == 4:
+        t0, t1, t2, t3 = (a | b | c for a, b, c in combinations(shared, 3))
+        turn_triples = (t0, t1, t2, t3)
+        bp0, bp1, bp2, bp3, bp4, bp5 = (a | b for a, b in combinations(shared, 2))
+        hero_turn = _score_list(hero_pairs, turn_triples)
 
-        # Value betting with strong equity
-        if eff_equity > 0.66 or (eff_equity > 0.56 and nut_rate > 0.35):
-            if Action.RAISE_POT in obs.legal_actions and (eff_equity > 0.72 or prof["is_station"] or spr <= 1.8):
-                return Action.RAISE_POT
-            if Action.RAISE_HALF in obs.legal_actions:
-                return Action.RAISE_HALF
+        n_avail = len(available)
+        passes = max(1, round(count / n_avail))
+        samples = []
+        total_share = 0.0
+        nut_wins = 0.0
 
-        # Medium-strength value / protection bet
-        if eff_equity > 0.54 and Action.RAISE_HALF in obs.legal_actions:
-            return Action.RAISE_HALF
+        for idx, r in enumerate(available):
+            new_triples = (r | bp0, r | bp1, r | bp2, r | bp3, r | bp4, r | bp5)
+            ours = max(hero_turn, _score_list(hero_pairs, new_triples))
+            rem = available[:idx] + available[idx + 1:]
 
-        # Exploitative Bluff / Semi-Bluff with Blockers or Redraws when opponent folds often
-        fold_eq = prof["fold_to_bet"]
-        if not prof["is_station"] and fold_eq > 0.44:
-            bluff_score = blocker_bonus + 0.5 * nut_rate + (0.04 if obs.is_button else 0.0)
-            if bluff_score >= 0.09 and Action.RAISE_HALF in obs.legal_actions:
-                return Action.RAISE_HALF
+            for _ in range(passes):
+                draw = rng.sample(rem, 5)
+                opp_pairs = [draw[i] | draw[j] for i, j in PAIRS_5]
+                opp_now = _score_list(opp_pairs, turn_triples)
+                opp_new = _score_list(opp_pairs, new_triples)
+                theirs = opp_now if opp_now > opp_new else opp_new
 
-        return Action.CHECK_CALL
+                share = 1.0 if ours > theirs else (0.5 if ours == theirs else 0.0)
+                total_share += share
+                if ours >= (6 << 20):
+                    nut_wins += share
+                opp_composite = (opp_now * 3) + (theirs * 2)
+                samples.append((opp_composite, share))
 
-    # CASE 2: We are facing a bet/raise (to_call > 0)
-    pot_odds = to_call / (pot + to_call)
+        total_n = len(samples)
+        samples.sort(key=lambda x: x[0])
+        sorted_shares = [s for _, s in samples]
+        return total_share / total_n, nut_wins / total_n, sorted_shares
 
-    # Compute EV of calling vs raising
-    # If shallow SPR (<= 1.4) and we have strong equity + redraws, commit stack
-    if eff_equity > 0.68 or (spr <= 1.4 and eff_equity > 0.54):
-        if Action.RAISE_POT in obs.legal_actions and eff_equity > 0.70:
-            return Action.RAISE_POT
-        if Action.RAISE_HALF in obs.legal_actions and eff_equity > 0.64:
-            return Action.RAISE_HALF
-        return Action.CHECK_CALL
+    # Flop
+    b0, b1, b2 = shared[0], shared[1], shared[2]
+    flop_triple = b0 | b1 | b2
+    hero_flop = max(TABLE[p | flop_triple] for p in hero_pairs)
 
-    # Semi-bluff raise against non-stations when holding massive nut redraw or blocker on small bet
-    if not prof["is_station"] and prof["fold_to_bet"] > 0.50 and to_call <= pot * 0.55:
-        if (nut_rate > 0.45 or blocker_bonus >= 0.08) and eff_equity > 0.42:
-            if Action.RAISE_HALF in obs.legal_actions:
-                return Action.RAISE_HALF
+    n_runouts = max(8, count // 2)
+    samples = []
+    total_share = 0.0
+    nut_wins = 0.0
 
-    # Call decision: compare effective equity against pot odds + implied odds buffer
-    implied_buffer = 0.035 if (obs.is_button and obs.street != Street.RIVER and nut_rate > 0.25) else 0.0
-    if eff_equity + implied_buffer >= pot_odds:
-        return Action.CHECK_CALL
+    pool = list(available)
+    rng.shuffle(pool)
+    for k in range(n_runouts):
+        i1 = (2 * k) % len(pool)
+        i2 = (2 * k + 1) % len(pool)
+        if i1 == i2:
+            i2 = (i2 + 1) % len(pool)
+        r1, r2 = pool[i1], pool[i2]
+        new_triples = (
+            r1 | b0 | b1, r1 | b0 | b2, r1 | b1 | b2,
+            r2 | b0 | b1, r2 | b0 | b2, r2 | b1 | b2,
+            r1 | r2 | b0, r1 | r2 | b1, r1 | r2 | b2,
+        )
+        ours = max(hero_flop, _score_list(hero_pairs, new_triples))
+        rem = [c for c in available if c != r1 and c != r2]
 
-    if Action.FOLD in obs.legal_actions:
-        return Action.FOLD
-    return Action.CHECK_CALL
+        for _ in range(2):
+            draw = rng.sample(rem, 5)
+            opp_pairs = [draw[i] | draw[j] for i, j in PAIRS_5]
+            opp_now = max(TABLE[p | flop_triple] for p in opp_pairs)
+            opp_new = _score_list(opp_pairs, new_triples)
+            theirs = opp_now if opp_now > opp_new else opp_new
+
+            share = 1.0 if ours > theirs else (0.5 if ours == theirs else 0.0)
+            total_share += share
+            if ours >= (6 << 20):
+                nut_wins += share
+            opp_composite = (opp_now * 3) + (theirs * 2)
+            samples.append((opp_composite, share))
+
+    total_n = len(samples)
+    samples.sort(key=lambda x: x[0])
+    sorted_shares = [s for _, s in samples]
+    return total_share / total_n, nut_wins / total_n, sorted_shares
+
+
+def _slice_equity(sorted_shares: list[float], low_frac: float, high_frac: float, noise_weight: float = 0.08) -> float:
+    n = len(sorted_shares)
+    if n == 0:
+        return 0.5
+    lo = max(0, min(n - 1, int(low_frac * n)))
+    hi = max(lo + 1, min(n, int(high_frac * n)))
+    in_sum = sum(sorted_shares[lo:hi])
+    in_cnt = hi - lo
+    out_sum = sum(sorted_shares[:lo]) + sum(sorted_shares[hi:])
+    out_cnt = n - in_cnt
+    num = in_sum + noise_weight * out_sum
+    den = in_cnt + noise_weight * out_cnt
+    return num / den if den > 0 else 0.5
+
+
+def choose_postflop_action(obs: g.Observation, prof: dict, num_samples: int = 32, memory: dict = None) -> g.Action:
+    # 0. Dead-Clock Exploit
+    if prof.get("is_clock_dead", False):
+        if g.Action.RAISE_HALF in obs.legal_actions:
+            return g.Action.RAISE_HALF
+        if g.Action.RAISE_POT in obs.legal_actions:
+            return g.Action.RAISE_POT
+        if g.Action.CHECK_CALL in obs.legal_actions:
+            return g.Action.CHECK_CALL
+        return obs.legal_actions[0]
+
+    rng = memory.get("rng") if memory else None
+    if rng is None:
+        rng = Random(202605 + obs.hand_index)
+
+    board_key = tuple(obs.board)
+    eq_data = memory.get("eq_data") if (memory and memory.get("board_key") == board_key) else None
+    if eq_data is None:
+        s_len = len(obs.board)
+        is_big = (obs.pot >= 16)
+        if s_len == 5:
+            count = 40 if is_big else 26
+        elif s_len == 4:
+            count = 27  # Exactly 27 river cards: full runout coverage
+        else:
+            count = 20 if is_big else 14
+        eq_data = compute_stratified_equities(obs.hole_cards, obs.board, rng, count)
+        if memory is not None:
+            memory["eq_data"] = eq_data
+            memory["board_key"] = board_key
+
+    raw_eq, nut_eq, sorted_shares = eq_data
+    river = (len(obs.board) == 5)
+    turn = (len(obs.board) == 4)
+    call_cost = obs.to_call
+    total_pot = obs.pot + call_cost
+    price = call_cost / total_pot if total_pot > 0 else 0.0
+    legal = obs.legal_actions
+
+    # 1. Blind Spammer Exploit
+    if prof.get("is_blind_spammer", False):
+        if call_cost == 0:
+            if raw_eq >= 0.55:
+                if g.Action.RAISE_POT in legal and raw_eq >= 0.63:
+                    return g.Action.RAISE_POT
+                if g.Action.RAISE_HALF in legal:
+                    return g.Action.RAISE_HALF
+            return g.Action.CHECK_CALL
+        else:
+            if raw_eq >= 0.58 or (raw_eq >= 0.52 and nut_eq >= 0.35):
+                if g.Action.RAISE_POT in legal and raw_eq >= 0.63:
+                    return g.Action.RAISE_POT
+                if g.Action.RAISE_HALF in legal:
+                    return g.Action.RAISE_HALF
+            if raw_eq >= price:
+                return g.Action.CHECK_CALL
+            if g.Action.FOLD in legal:
+                return g.Action.FOLD
+            return g.Action.CHECK_CALL
+
+    # 2. Case 1: Checked to us (call_cost == 0)
+    if call_cost == 0:
+        if obs.is_button:
+            eq_vs_check = _slice_equity(sorted_shares, 0.0, 0.72, noise_weight=0.12)
+            if river:
+                if g.Action.RAISE_POT in legal and (raw_eq >= 0.655 or eq_vs_check >= 0.80):
+                    return g.Action.RAISE_POT
+                if g.Action.RAISE_HALF in legal and (raw_eq >= 0.515 or eq_vs_check >= 0.66):
+                    return g.Action.RAISE_HALF
+                return g.Action.CHECK_CALL
+            else:
+                if g.Action.RAISE_POT in legal and (raw_eq >= 0.675 or (raw_eq >= 0.62 and nut_eq >= 0.38)):
+                    return g.Action.RAISE_POT
+                if g.Action.RAISE_HALF in legal and (raw_eq >= 0.525 or eq_vs_check >= 0.65):
+                    return g.Action.RAISE_HALF
+                return g.Action.CHECK_CALL
+        else:
+            station_adj = -0.04 if prof.get("is_station", False) else 0.0
+            if river:
+                if g.Action.RAISE_POT in legal and raw_eq >= 0.72 + station_adj:
+                    return g.Action.RAISE_POT
+                if g.Action.RAISE_HALF in legal and raw_eq >= 0.565 + station_adj:
+                    return g.Action.RAISE_HALF
+                return g.Action.CHECK_CALL
+            else:
+                if g.Action.RAISE_POT in legal and raw_eq >= 0.71 + station_adj:
+                    return g.Action.RAISE_POT
+                if g.Action.RAISE_HALF in legal and raw_eq >= 0.575 + station_adj:
+                    return g.Action.RAISE_HALF
+                return g.Action.CHECK_CALL
+
+    # 3. Case 2: Facing bet or raise (call_cost > 0)
+    opp_is_pot = call_cost >= (obs.pot - call_cost) * 0.75
+    opp_raised_us = obs.raises_this_street >= 2 or obs.my_bet > 0
+
+    if opp_raised_us:
+        low_cutoff = 0.75
+        noise = 0.06
+    elif opp_is_pot:
+        low_cutoff = 0.62
+        noise = 0.08
+    else:
+        low_cutoff = 0.50
+        noise = 0.12
+
+    if not river:
+        noise = min(0.35, noise + (0.10 if not turn else 0.05))
+
+    effective_eq = _slice_equity(sorted_shares, low_cutoff, 1.0, noise_weight=noise)
+
+    # Raise for value
+    if g.Action.RAISE_HALF in legal:
+        raise_h = 0.64 + 0.04 * obs.raises_this_street
+        raise_p = 0.74 + 0.04 * obs.raises_this_street
+        if g.Action.RAISE_POT in legal and (effective_eq >= raise_p or (river and raw_eq >= 0.88)):
+            return g.Action.RAISE_POT
+        if effective_eq >= raise_h or (not river and raw_eq >= 0.78 and nut_eq >= 0.45):
+            return g.Action.RAISE_HALF
+
+    # Call vs Fold
+    if g.Action.FOLD in legal:
+        committed = call_cost >= min(obs.my_stack, obs.opp_stack + call_cost)
+        pos_penalty = 0.025 if (not obs.is_button and not river) else 0.0
+        implied_adj = -0.030 * nut_eq + 0.020 * (1.0 - nut_eq) if not river else 0.0
+        future_cost = 0.0 if (committed or river) else max(0.0, 0.020 + pos_penalty + implied_adj)
+        req_eq = price + future_cost
+        if river and prof.get("post_agg", 0.30) < 0.35:
+            req_eq += 0.030 if opp_is_pot else 0.015
+        if effective_eq < req_eq:
+            return g.Action.FOLD
+
+    return g.Action.CHECK_CALL
