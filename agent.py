@@ -40,7 +40,7 @@ warmup()
 
 # rename as your team/bot's name
 PARTICIPANT = "BANG"
-AGENT_NAME = "LarpGentV3"
+AGENT_NAME = "LarpGentV4"
 
 
 # ===== YOUR CODE HERE =====
@@ -66,7 +66,7 @@ def _safe_fallback(obs: Observation) -> Action:
 
 def _choose_preflop_action(obs: Observation, prof: dict) -> Action:
     # 0. Dead-Clock Auto-Print: When opponent is timed out / auto-folding, bet 100% of hands
-    if prof.get("is_clock_dead", False):
+    if prof.get("is_auto_folding", False) or prof.get("is_clock_dead", False):
         if Action.RAISE_HALF in obs.legal_actions:
             return Action.RAISE_HALF
         if Action.RAISE_POT in obs.legal_actions:
@@ -81,116 +81,72 @@ def _choose_preflop_action(obs: Observation, prof: dict) -> Action:
     if obs.is_button:
         strength += 0.035
 
-    # 1. SPECIAL PREFLOP EXPLOIT VS BLIND SPAMMERS (Always-Half / Always-Pot bots)
-    if prof.get("is_blind_spammer", False):
-        # Punish their 100% raising range with top hands
+    pf_agg = prof.get("agg_freq", [0.35])[0]
+
+    # 1. Universal Preflop Exploit vs Blind Spammers (Always-Half / Always-Pot bots)
+    if prof.get("is_blind_spammer", False) or pf_agg > 0.82:
         if strength >= 0.58:
             if Action.RAISE_POT in obs.legal_actions and strength >= 0.64:
                 return Action.RAISE_POT
             if Action.RAISE_HALF in obs.legal_actions:
                 return Action.RAISE_HALF
             return Action.CHECK_CALL
-        # Call their raises with playable hands
         if strength >= 0.45 or obs.to_call <= obs.big_blind:
             return Action.CHECK_CALL
         if Action.FOLD in obs.legal_actions:
             return Action.FOLD
         return Action.CHECK_CALL
 
-    # 2. SPECIAL PREFLOP EXPLOIT VS AGGRO SHARK (e.g. Riverglass / Hari)
-    if prof.get("is_aggro_shark", False):
-        # Open button with playable hands, fold bottom junk
-        if obs.is_button and obs.to_call <= obs.big_blind:
-            if strength >= 0.56 and Action.RAISE_POT in obs.legal_actions:
-                return Action.RAISE_POT
-            if strength >= 0.43 and Action.RAISE_HALF in obs.legal_actions:
-                return Action.RAISE_HALF
-            if strength < 0.36 and Action.FOLD in obs.legal_actions:
-                return Action.FOLD
-            if Action.CHECK_CALL in obs.legal_actions:
-                return Action.CHECK_CALL
-        # Big blind facing limp (call_cost == 0)
-        elif not obs.is_button and obs.to_call == 0:
-            if strength >= 0.56 and Action.RAISE_POT in obs.legal_actions:
-                return Action.RAISE_POT
-            if strength >= 0.48 and Action.RAISE_HALF in obs.legal_actions:
-                return Action.RAISE_HALF
-            return Action.CHECK_CALL
-        # Facing a raise: 3-bet for value with premium hands, fold dominated trash
-        elif obs.to_call > obs.big_blind:
-            pot_odds = obs.to_call / float(obs.pot + obs.to_call)
-            # Facing an open-raise (raises_this_street == 1)
-            if obs.raises_this_street == 1:
-                if strength >= 0.64 and Action.RAISE_POT in obs.legal_actions:
-                    return Action.RAISE_POT
-                if strength >= 0.58 and Action.RAISE_HALF in obs.legal_actions:
-                    return Action.RAISE_HALF
-                # Defend with playable hands, fold junk OOP
-                req = max(0.43, pot_odds + 0.10 - (0.03 if obs.is_button else 0.0))
-                if strength >= req:
-                    return Action.CHECK_CALL
-                if Action.FOLD in obs.legal_actions:
-                    return Action.FOLD
-                return Action.CHECK_CALL
-            # Facing a 3-bet or 4-bet (raises_this_street >= 2)
-            else:
-                if obs.to_call >= obs.big_blind * 8:
-                    # 4-bet shove defense: only continue with monster hands (AAxx / double pair)
-                    if strength >= 0.82 and Action.RAISE_POT in obs.legal_actions:
-                        return Action.RAISE_POT
-                    if strength >= 0.60:
-                        return Action.CHECK_CALL
-                    if Action.FOLD in obs.legal_actions:
-                        return Action.FOLD
-                    return Action.CHECK_CALL
-                else:
-                    if strength >= 0.76 and Action.RAISE_POT in obs.legal_actions:
-                        return Action.RAISE_POT
-                    req = max(0.48, pot_odds + 0.12 - (0.02 if obs.is_button else 0.0))
-                    if strength >= req:
-                        return Action.CHECK_CALL
-                    if Action.FOLD in obs.legal_actions:
-                        return Action.FOLD
-                    return Action.CHECK_CALL
-
-    # 3. Standard opponent adjustments
-    if prof.get("is_nit", False) and obs.raises_this_street >= 1:
-        strength -= 0.040
-
-    # Unopened pot or limped pot (to_call <= 2)
+    # 2. Unopened pot or limped pot (to_call <= big_blind)
     if obs.to_call <= obs.big_blind:
-        if strength >= 0.57 and Action.RAISE_POT in obs.legal_actions:
+        if strength >= 0.56 and Action.RAISE_POT in obs.legal_actions:
             return Action.RAISE_POT
-        if strength >= 0.48 and Action.RAISE_HALF in obs.legal_actions:
+        if strength >= 0.46 and Action.RAISE_HALF in obs.legal_actions:
             return Action.RAISE_HALF
-        if obs.to_call == 0:
-            return Action.CHECK_CALL
-        if obs.to_call == 1 and strength >= 0.35:
+        if obs.to_call <= 1:
             return Action.CHECK_CALL
         if Action.FOLD in obs.legal_actions:
             return Action.FOLD
         return Action.CHECK_CALL
 
-    # Facing a preflop raise (to_call > 2)
+    # 3. Facing a preflop raise (to_call > big_blind)
     pot_odds = obs.to_call / float(obs.pot + obs.to_call)
 
+    # Facing an open-raise (raises_this_street == 1)
     if obs.raises_this_street == 1:
-        if strength >= 0.64 and Action.RAISE_POT in obs.legal_actions:
+        min_pot_raise = 0.68 if obs.is_button else 0.74
+        min_half_raise = 0.60 if obs.is_button else 0.66
+        if strength >= min_pot_raise and Action.RAISE_POT in obs.legal_actions:
             return Action.RAISE_POT
-        if strength >= 0.58 and Action.RAISE_HALF in obs.legal_actions:
+        if strength >= min_half_raise and Action.RAISE_HALF in obs.legal_actions:
             return Action.RAISE_HALF
-        required_strength = max(0.43, pot_odds + 0.11 - (0.03 if obs.is_button else 0.0))
-    else:
-        if strength >= 0.72 and Action.RAISE_POT in obs.legal_actions:
-            return Action.RAISE_POT
-        required_strength = max(0.49, pot_odds + 0.14 - (0.02 if obs.is_button else 0.0))
-
-    if strength >= required_strength:
+        req = max(0.44, pot_odds + 0.10 - (0.04 if obs.is_button else 0.0))
+        if strength >= req:
+            return Action.CHECK_CALL
+        if Action.FOLD in obs.legal_actions:
+            return Action.FOLD
         return Action.CHECK_CALL
 
-    if Action.FOLD in obs.legal_actions:
-        return Action.FOLD
-    return Action.CHECK_CALL
+    # Facing a 3-bet or 4-bet (raises_this_street >= 2)
+    else:
+        if obs.to_call >= obs.big_blind * 8:
+            # 4-bet shove defense: continue only with premium monster hands (AAxx / double suited broadway)
+            if strength >= 0.86 and Action.RAISE_POT in obs.legal_actions:
+                return Action.RAISE_POT
+            if strength >= 0.78:
+                return Action.CHECK_CALL
+            if Action.FOLD in obs.legal_actions:
+                return Action.FOLD
+            return Action.CHECK_CALL
+        else:
+            if strength >= 0.80 and Action.RAISE_POT in obs.legal_actions:
+                return Action.RAISE_POT
+            req = max(0.52, pot_odds + 0.12 - (0.02 if obs.is_button else 0.0))
+            if strength >= req:
+                return Action.CHECK_CALL
+            if Action.FOLD in obs.legal_actions:
+                return Action.FOLD
+            return Action.CHECK_CALL
 
 
 def new_half(config, memory: dict) -> None:
@@ -212,28 +168,30 @@ def choose_action(obs: Observation, memory: dict) -> Action:
         if obs.street == Street.PREFLOP:
             action = _choose_preflop_action(obs, prof)
         else:
-            # Dynamic Time-Bank Allocation (8.0s limit per 1,000 hands; target 3.8s-4.8s)
+            # Dynamic Time-Bank Allocation (target 4.8s-5.8s per 1,000 hands)
             spent = memory.get("time_spent", 0.0)
             hand_idx = obs.hand_index
-            target_spent = 4.5 * (hand_idx / 1000.0)
-            pot = obs.pot
-            is_big_pot = (pot >= 12)
+            allowed_time = 4.8 * ((hand_idx + 1) / 1000.0)
 
-            # Base sample budget by street (optimized for speed + accuracy)
-            if obs.street == Street.RIVER:
-                base_samples = 40 if is_big_pot else 26
-            elif obs.street == Street.TURN:
-                base_samples = 27
+            is_contested = (obs.pot >= 10) or (obs.to_call > 0)
+            s_len = len(obs.board)
+
+            if s_len == 5:
+                base_samples = 28 if is_contested else 18
+            elif s_len == 4:
+                base_samples = 20 if is_contested else 14
             else:  # Flop
-                base_samples = 20 if is_big_pot else 14
+                base_samples = 16 if is_contested else 10
 
-            # Dynamic pacing adjustments to strictly prevent timing out
-            if spent > 5.5:
+            # Dynamic pacing to ensure we stay around ~5.0s out of 8.0s limit
+            if spent > 6.8:
+                samples = 8
+            elif spent > 6.0:
                 samples = 10
-            elif spent > 4.5:
-                samples = 16
-            elif spent > target_spent + 0.4:
-                samples = 18 if is_big_pot else 12
+            elif spent > 5.2 or spent > allowed_time + 0.4:
+                samples = max(10, int(base_samples * 0.55))
+            elif spent > allowed_time:
+                samples = max(12, int(base_samples * 0.75))
             else:
                 samples = base_samples
 
@@ -244,9 +202,9 @@ def choose_action(obs: Observation, memory: dict) -> Action:
     except Exception:
         action = _safe_fallback(obs)
     finally:
-        # Accounting for execution time plus Windows localhost HTTP overhead (~2.2ms - 1ms grace = +1.3ms)
+        # Accounting for execution time plus slight HTTP loopback margin
         compute_time = time.perf_counter() - t0
-        charged_est = compute_time + 0.0013
+        charged_est = compute_time + 0.0004
         memory["time_spent"] = memory.get("time_spent", 0.0) + charged_est
 
     return action
